@@ -1,12 +1,20 @@
 services:
   - type: web
-    name: ren-gateway
+    name: tryak-gateway
     runtime: python
-    plan: free
     buildCommand: pip install -r requirements.txt
-    startCommand: python main.py
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT --workers 1
+    plan: free
     envVars:
-      - key: ADMIN_PASSWORD
-        value: admin
       - key: SECRET_KEY
         generateValue: true
+      - key: ADMIN_PASSWORD
+        value: ""
+      - key: BOT_TOKEN
+        value: ""
+      - key: BOT_PASSWORD
+        value: ""
+      - key: ADMIN_CHAT_IDS
+        value: ""
+      - key: PUBLIC_DOMAIN
+        value: ""
