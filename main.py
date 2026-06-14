@@ -70,6 +70,8 @@ stats = {
     "daily_connections": defaultdict(int),
     "daily_traffic": defaultdict(int),
     "daily_countries": defaultdict(lambda: defaultdict(int)),
+    # IP های یکتا هر روز (set) - برای گزارش روزانه
+    "daily_unique_ips": defaultdict(set),
 }
 error_logs: deque = deque(maxlen=50)
 hourly_traffic: dict = defaultdict(int)
@@ -80,6 +82,19 @@ active_connections: dict = {}
 
 SESSION_COOKIE = "rvg_session"
 SESSION_TTL    = 60 * 60 * 24 * 7
+
+# ───────── IP Deduplication Cache ─────────
+# کلید: (uid, ip) → زمان اولین اتصال
+# هدف: جلوگیری از ارسال پیام تکراری برای reconnect های سریع
+_notified_connections: dict = {}   # (uid, ip) -> timestamp
+_NOTIF_COOLDOWN = 300              # ۵ دقیقه - بعد از این مدت دوباره نوتیف بده
+
+# ───────── IP Traffic Tracking ─────────
+# ip -> {"upload": int, "download": int, "total": int, "country_code": str, "country": str}
+ip_traffic: dict = defaultdict(lambda: {"upload": 0, "download": 0, "total": 0, "country_code": "", "country": ""})
+
+# uid -> set of unique IPs (IP های یکتا نه session ها)
+active_link_ips: dict = defaultdict(set)
 
 # ───────── Persistence ─────────
 def save_data():
@@ -214,7 +229,13 @@ async def tg_notify_all(text: str):
         await tg_send(cid, text)
 
 async def notify_new_connection(uid: str, ip: str, conn_id: str):
-    if not BOT_TOKEN and not ADMIN_CHAT_IDS: return
+    """
+    ارسال نوتیف اتصال جدید - با جلوگیری از ارسال تکراری برای یک IP.
+    اگر همان IP در ۵ دقیقه اخیر نوتیف گرفته، فقط آمار IP های فعال آپدیت می‌شود.
+    """
+    if not BOT_TOKEN or not ADMIN_CHAT_IDS:
+        return
+
     link = LINKS.get(uid, {})
     label = link.get("label", "نامشخص")
     info = await get_ip_info(ip)
@@ -223,7 +244,33 @@ async def notify_new_connection(uid: str, ip: str, conn_id: str):
     city = info.get("city", "نامشخص")
     isp = info.get("isp", "نامشخص")
     is_proxy = "⚠️ VPN/Proxy" if info.get("proxy") or info.get("hosting") else "✅ مستقیم"
-    active_count = len(active_link_conns.get(uid, set()))
+
+    # ذخیره اطلاعات کشور IP در ip_traffic
+    if country_code:
+        ip_traffic[ip]["country_code"] = country_code
+        ip_traffic[ip]["country"] = country
+
+    # شمارش IP های یکتا فعال این لینک
+    active_unique_ips = len(active_link_ips.get(uid, set()))
+
+    # بررسی deduplication - اگر این IP اخیراً نوتیف گرفته، پیام جدید نفرست
+    cache_key = (uid, ip)
+    now_ts = time.time()
+    last_notif = _notified_connections.get(cache_key, 0)
+
+    if now_ts - last_notif < _NOTIF_COOLDOWN:
+        # فقط لاگ بزن - پیام تلگرام نفرست
+        logger.info(f"🔁 IP {ip} reconnect (no notification, cooldown active)")
+        return
+
+    # ثبت زمان نوتیف برای این IP
+    _notified_connections[cache_key] = now_ts
+
+    # اطلاعات مصرف این IP
+    ip_data = ip_traffic.get(ip, {})
+    up_bytes = ip_data.get("upload", 0)
+    down_bytes = ip_data.get("download", 0)
+    total_bytes = ip_data.get("total", 0)
 
     msg = (
         f"🔌 *اتصال جدید!*\n"
@@ -234,7 +281,14 @@ async def notify_new_connection(uid: str, ip: str, conn_id: str):
         f"🏙 شهر: {city}\n"
         f"📡 ISP: {isp}\n"
         f"🔍 نوع: {is_proxy}\n"
-        f"👥 اتصالات فعال این لینک: {active_count}\n"
+        f"\n"
+        f"👥 IP فعال این لینک: `{active_unique_ips}`\n"
+        f"\n"
+        f"📦 مصرف:\n"
+        f"  ⬆️ Upload: `{fmt_bytes(up_bytes)}`\n"
+        f"  ⬇️ Download: `{fmt_bytes(down_bytes)}`\n"
+        f"  📊 مجموع: `{fmt_bytes(total_bytes)}`\n"
+        f"\n"
         f"⏰ زمان: `{datetime.now().strftime('%H:%M:%S')}`"
     )
     kb = {"inline_keyboard": [[
@@ -254,20 +308,52 @@ async def notify_service_wake():
     await tg_notify_all(msg)
 
 async def send_daily_report():
-    if not ADMIN_CHAT_IDS: return
+    """گزارش روزانه با IP های یکتا و ۱۰ IP پرمصرف"""
+    if not ADMIN_CHAT_IDS:
+        return
+
     d = today()
-    conns = stats["daily_connections"].get(d, 0)
     traffic = stats["daily_traffic"].get(d, 0)
+
+    # شمارش IP های یکتا روزانه (نه تعداد session)
+    unique_ips_today = stats["daily_unique_ips"].get(d, set())
+    unique_ip_count = len(unique_ips_today)
+
+    # آمار کشورها بر اساس IP یکتا
     countries = stats["daily_countries"].get(d, {})
     top_countries = sorted(countries.items(), key=lambda x: x[1], reverse=True)[:5]
-    top_str = "\n".join([f"  {flag(c)} {c}: {n}" for c, n in top_countries]) or "  هیچ اتصالی"
+    top_str = "\n".join([f"  {flag(c)} {c}: {n} IP" for c, n in top_countries]) or "  هیچ اتصالی"
+
+    # ۱۰ IP پرمصرف روز
+    # فقط IP هایی که امروز فعال بودند
+    today_ips = []
+    for ip in unique_ips_today:
+        data = ip_traffic.get(ip)
+        if data:
+            today_ips.append((ip, data))
+
+    top_ips = sorted(today_ips, key=lambda x: x[1].get("total", 0), reverse=True)[:10]
+
+    if top_ips:
+        top_ips_lines = []
+        for i, (ip, data) in enumerate(top_ips, 1):
+            cc = data.get("country_code", "")
+            country_name = data.get("country", "نامشخص")
+            total = data.get("total", 0)
+            flag_emoji = flag(cc)
+            top_ips_lines.append(f"  {i}) `{ip}` 📦 {fmt_bytes(total)} {flag_emoji} {country_name}")
+        top_ips_str = "\n".join(top_ips_lines)
+    else:
+        top_ips_str = "  هنوز اطلاعاتی ثبت نشده"
 
     msg = (
         f"📊 *گزارش روزانه · {d}*\n"
         f"{'─' * 28}\n"
-        f"🔌 اتصالات: `{conns}`\n"
+        f"👥 IP های فعال: `{unique_ip_count}`\n"
         f"📦 ترافیک: `{fmt_bytes(traffic)}`\n"
         f"🌍 کشورهای برتر:\n{top_str}\n"
+        f"{'─' * 28}\n"
+        f"🔥 ۱۰ IP پرمصرف روز:\n{top_ips_str}\n"
         f"{'─' * 28}\n"
         f"🔗 کل لینک‌ها: {len(LINKS)}\n"
         f"⏱ آپتایم: `{uptime()}`"
@@ -312,6 +398,23 @@ async def scheduler_loop():
                 save_data()
                 label = link.get("label", uid[:8])
                 await tg_notify_all(f"⏰ لینک *{label}* منقضی و غیرفعال شد.")
+
+        # پاکسازی cache نوتیف‌های قدیمی (بیشتر از ۱ ساعت)
+        expired_notif_keys = [
+            k for k, t in list(_notified_connections.items())
+            if now_ts - t > 3600
+        ]
+        for k in expired_notif_keys:
+            _notified_connections.pop(k, None)
+
+        # پاکسازی cache کشور tracking قدیمی (کلیدهای دیروز)
+        yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+        stale_country_keys = [
+            k for k in list(_ip_cache.keys())
+            if k.startswith(f"_country_tracked_{yesterday}_")
+        ]
+        for k in stale_country_keys:
+            _ip_cache.pop(k, None)
 
 # ───────── Telegram Polling ─────────
 async def tg_process_update(update: dict):
@@ -648,9 +751,17 @@ async def ws_vless(ws: WebSocket, uid: str, request: Request = None):
     # Register connection
     active_connections[conn_id] = {
         "uid": uid, "ip": client_ip,
-        "connected_at": datetime.now().isoformat(), "bytes": 0
+        "connected_at": datetime.now().isoformat(), "bytes": 0,
+        "upload": 0, "download": 0,
     }
     active_link_conns[uid].add(conn_id)
+
+    # ثبت IP یکتا برای این لینک
+    active_link_ips[uid].add(client_ip)
+
+    # ثبت IP یکتا در آمار روزانه
+    stats["daily_unique_ips"][today()].add(client_ip)
+
     stats["total_requests"] += 1
     stats["daily_connections"][today()] = stats["daily_connections"].get(today(), 0) + 1
 
@@ -703,6 +814,7 @@ async def ws_vless(ws: WebSocket, uid: str, request: Request = None):
 
         # Relay
         async def ws_to_tcp():
+            """کلاینت → سرور = Upload"""
             try:
                 while True:
                     data = await ws.receive_bytes()
@@ -714,6 +826,10 @@ async def ws_vless(ws: WebSocket, uid: str, request: Request = None):
                     hourly_traffic[now_hour()] += n
                     if uid in LINKS: LINKS[uid]["used_bytes"] += n
                     active_connections[conn_id]["bytes"] += n
+                    active_connections[conn_id]["upload"] += n
+                    # ثبت upload برای IP
+                    ip_traffic[client_ip]["upload"] += n
+                    ip_traffic[client_ip]["total"] += n
                     # Check quota mid-connection
                     if LINKS.get(uid, {}).get("limit_bytes"):
                         if LINKS[uid]["used_bytes"] >= LINKS[uid]["limit_bytes"]:
@@ -722,6 +838,7 @@ async def ws_vless(ws: WebSocket, uid: str, request: Request = None):
             finally: writer.close()
 
         async def tcp_to_ws():
+            """سرور → کلاینت = Download"""
             try:
                 while True:
                     data = await reader.read(65536)
@@ -733,6 +850,10 @@ async def ws_vless(ws: WebSocket, uid: str, request: Request = None):
                     hourly_traffic[now_hour()] += n
                     if uid in LINKS: LINKS[uid]["used_bytes"] += n
                     active_connections[conn_id]["bytes"] += n
+                    active_connections[conn_id]["download"] += n
+                    # ثبت download برای IP
+                    ip_traffic[client_ip]["download"] += n
+                    ip_traffic[client_ip]["total"] += n
             except: pass
 
         await asyncio.gather(ws_to_tcp(), tcp_to_ws())
@@ -743,18 +864,49 @@ async def ws_vless(ws: WebSocket, uid: str, request: Request = None):
     finally:
         active_connections.pop(conn_id, None)
         active_link_conns[uid].discard(conn_id)
+
+        # بررسی: آیا session دیگری از همین IP روی همین لینک هست؟
+        # اگر نه، IP را از active_link_ips حذف کن
+        other_sessions_same_ip = any(
+            info.get("ip") == client_ip and info.get("uid") == uid
+            for info in active_connections.values()
+        )
+        if not other_sessions_same_ip:
+            active_link_ips[uid].discard(client_ip)
+            # پاک کردن cache نوتیف بعد از timeout واقعی (نه فوری)
+            # این اجازه می‌دهد بعد از cooldown دوباره نوتیف بده
+
         try: await ws.close()
         except: pass
         save_data()
-        logger.info(f"🔌 WS [{conn_id}] closed")
+        logger.info(f"🔌 WS [{conn_id}] closed ip={client_ip}")
 
 async def _track_country(ip: str):
+    """
+    ردیابی کشور بر اساس IP یکتا.
+    اگر این IP امروز قبلاً شمرده شده، دوباره شمارش نشود.
+    """
     info = await get_ip_info(ip)
     cc = info.get("countryCode", "XX")
+    country_name = info.get("country", "نامشخص")
     d = today()
+
+    # ذخیره اطلاعات کشور در ip_traffic
+    if cc and cc != "XX":
+        ip_traffic[ip]["country_code"] = cc
+        ip_traffic[ip]["country"] = country_name
+
+    # فقط اگر این IP امروز قبلاً برای این کشور شمرده نشده
     if d not in stats["daily_countries"]:
         stats["daily_countries"][d] = defaultdict(int)
-    stats["daily_countries"][d][cc] += 1
+
+    # بررسی اینکه آیا این IP قبلاً در daily_unique_ips ثبت بوده
+    # (ثبت در daily_unique_ips در WebSocket handler انجام می‌شه)
+    # اینجا فقط کشور را برای IP های جدید ثبت می‌کنیم
+    already_counted_key = f"_country_tracked_{d}_{ip}"
+    if not _ip_cache.get(already_counted_key):
+        stats["daily_countries"][d][cc] += 1
+        _ip_cache[already_counted_key] = True  # استفاده از ip_cache برای tracking
 
 # ───────── Subscription Endpoint ─────────
 @app.get("/sub/{uid}")
