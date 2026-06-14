@@ -230,12 +230,25 @@ async def get_stats(_=Depends(require_auth)):
 
 @app.post("/api/links")
 async def create_link(request: Request, _=Depends(require_auth)):
+    import re as _re
     body = await request.json()
     label = (body.get("label") or "New Link").strip()[:60]
     limit_value = float(body.get("limit_value") or 0)
     limit_unit = body.get("limit_unit") or "GB"
     limit_bytes = 0 if limit_value <= 0 else parse_size_to_bytes(limit_value, limit_unit)
-    uid = generate_uuid(label)
+    custom_uuid = (body.get("custom_uuid") or "").strip()
+    uuid_pattern = _re.compile(r'^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$')
+    if custom_uuid:
+        if not uuid_pattern.match(custom_uuid):
+            from fastapi import HTTPException
+            raise HTTPException(status_code=400, detail="Invalid UUID format. Expected: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx")
+        uid = custom_uuid.lower()
+        async with LINKS_LOCK:
+            if uid in LINKS:
+                from fastapi import HTTPException
+                raise HTTPException(status_code=409, detail="UUID already exists")
+    else:
+        uid = generate_uuid(label)
     async with LINKS_LOCK:
         LINKS[uid] = {"label": label, "limit_bytes": limit_bytes, "used_bytes": 0, "created_at": datetime.now().isoformat(), "active": True}
     return {"uuid": uid, "label": label, "limit_bytes": limit_bytes, "used_bytes": 0, "active": True, "created_at": LINKS[uid]["created_at"], "vless_link": generate_vless_link(uid, remark=f"REN-{label}")}
@@ -884,6 +897,14 @@ body[dir="rtl"]{direction:rtl;text-align:right}
         <select class="form-select" id="new-unit"><option value="GB">GB</option></select>
       </div>
     </div>
+    <div class="form-group">
+      <label class="form-label" style="display:flex;align-items:center;justify-content:space-between">
+        <span>UUID <span style="font-weight:400;color:var(--text3);text-transform:none;font-size:10px">(optional)</span></span>
+        <button type="button" onclick="generateAndFillUUID()" style="background:none;border:1px solid var(--border);border-radius:6px;color:var(--text2);font-size:10px;padding:2px 8px;cursor:pointer;letter-spacing:0;text-transform:none;font-family:inherit;transition:all .2s" onmouseover="this.style.borderColor='var(--primary)';this.style.color='var(--primary)'" onmouseout="this.style.borderColor='var(--border)';this.style.color='var(--text2)'">Generate</button>
+      </label>
+      <input class="form-input" id="new-uuid" placeholder="Leave empty to auto-generate" style="font-family:monospace;font-size:12px" oninput="validateUUIDInput(this)">
+      <div id="uuid-error" style="color:var(--red);font-size:11px;margin-top:4px;display:none">Invalid format. Expected: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx</div>
+    </div>
     <button class="btn btn-primary" onclick="createLink()" style="width:100%;margin-top:8px;justify-content:center">Create</button>
   </div>
 </div>
@@ -1016,10 +1037,21 @@ async function quickCreate(limit,unit){
   try{const r=await fetch('/api/links',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({label:name,limit_value:limit,limit_unit:unit})});if(!r.ok)throw new Error();toast('Created: '+name);await loadLinks();await loadStats();}catch(e){toast('Error',true)}
 }
 
+function generateUUIDv4(){return'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g,c=>{const r=Math.random()*16|0;return(c==='x'?r:(r&0x3|0x8)).toString(16)});}
+function generateAndFillUUID(){$('#new-uuid').value=generateUUIDv4();$('#uuid-error').style.display='none';}
+function validateUUIDInput(el){const v=el.value.trim();const errEl=$('#uuid-error');if(v===''){errEl.style.display='none';return;}const ok=/^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/.test(v);errEl.style.display=ok?'none':'block';}
 async function createLink(){
   const label=$('#new-label').value.trim()||'New Link';const val=parseFloat($('#new-limit').value)||0;const unit='GB';
   if(!/^[a-zA-Z0-9\-_. ]+$/.test(label)){toast('Only English letters allowed',true);return;}
-  try{const r=await fetch('/api/links',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({label,limit_value:val,limit_unit:unit})});if(!r.ok)throw new Error();toast('Created');$('#new-label').value='';$('#new-limit').value='';$('#add-modal').classList.remove('show');await loadLinks();await loadStats();}catch(e){toast('Error',true)}
+  const customUuid=$('#new-uuid').value.trim();
+  if(customUuid&&!/^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/.test(customUuid)){toast('Invalid UUID format',true);return;}
+  try{
+    const body={label,limit_value:val,limit_unit:unit};
+    if(customUuid)body.custom_uuid=customUuid;
+    const r=await fetch('/api/links',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    if(!r.ok){const err=await r.json().catch(()=>({}));toast(err.detail||'Error',true);return;}
+    toast('Created');$('#new-label').value='';$('#new-limit').value='';$('#new-uuid').value='';$('#uuid-error').style.display='none';$('#add-modal').classList.remove('show');await loadLinks();await loadStats();
+  }catch(e){toast('Error',true)}
 }
 
 async function resetUsage(uid){try{await fetch(`/api/links/${uid}`,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({reset_usage:true})});toast('Reset');await loadLinks();}catch(e){}}
