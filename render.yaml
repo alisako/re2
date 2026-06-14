@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: rvg-gateway-v2
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT --workers 1
+    plan: free
+    envVars:
+      - key: SECRET_KEY
+        generateValue: true
+      - key: ADMIN_PASSWORD
+        value: 82829090
+      - key: BOT_TOKEN
+        value: 8936900695:AAGzSJXxgVqgAg-MSbe2wQO-FNNvyP3Q8Kw
+      - key: BOT_PASSWORD
+        value: 82829090
+      - key: ADMIN_CHAT_IDS
+        value: 7605025529
+      - key: RENDER_EXTERNAL_URL
+        value: ""
