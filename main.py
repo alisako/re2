@@ -459,28 +459,39 @@ async def xhttp_tcp_relay(session: XHTTPSession):
             XHTTP_SESSIONS.pop(session.conn_id, None)
 
 
-@app.get("/xhttp/{uuid}")
-async def xhttp_downstream(uuid: str, request: Request, sid: str = ""):
-    """
-    Client opens GET to receive data stream (server → client).
-    Returns chunked HTTP response streaming bytes.
-    """
-    await ensure_default_link()
-
-    if not await check_quota(uuid, 0):
-        raise HTTPException(status_code=403, detail="quota exceeded or link disabled")
-
-    # Use sid query param or X-Padding header as session identifier
-    session_id = sid or request.headers.get("x-padding", "") or secrets.token_urlsafe(8)
-
+async def _get_or_create_session(uuid: str, session_id: str) -> "XHTTPSession":
+    """Get existing session or create a new one and start its relay task."""
     async with XHTTP_SESSIONS_LOCK:
         session = XHTTP_SESSIONS.get(session_id)
         if session is None:
             session = XHTTPSession(uuid)
             session.conn_id = session_id
             XHTTP_SESSIONS[session_id] = session
-            # Start TCP relay coroutine
             asyncio.create_task(xhttp_tcp_relay(session))
+    return session
+
+
+# ── Xray XHTTP actual URL pattern ──────────────────────────────────────────
+#  GET  /xhttp/{uuid}/{session_id}            → downstream (server→client)
+#  POST /xhttp/{uuid}/{session_id}/{seq}      → upstream   (client→server)
+#
+# Xray appends the session UUID as a path segment, and POST chunks have a
+# sequence number as a final path segment.
+# ---------------------------------------------------------------------------
+
+@app.get("/xhttp/{uuid}/{session_id}")
+async def xhttp_downstream(uuid: str, session_id: str, request: Request):
+    """
+    Xray opens GET /xhttp/{uuid}/{session_id} to receive the response stream.
+    We stream bytes back indefinitely until the tunnel closes.
+    """
+    await ensure_default_link()
+
+    if not await check_quota(uuid, 0):
+        raise HTTPException(status_code=403, detail="quota exceeded or link disabled")
+
+    logger.info(f"[XHTTP] GET session={session_id} uuid={uuid}")
+    session = await _get_or_create_session(uuid, session_id)
 
     async def generate():
         try:
@@ -488,8 +499,7 @@ async def xhttp_downstream(uuid: str, request: Request, sid: str = ""):
                 try:
                     chunk = await asyncio.wait_for(session.to_client.get(), timeout=120.0)
                 except asyncio.TimeoutError:
-                    # Send keepalive empty bytes
-                    yield b""
+                    yield b""   # keepalive
                     continue
                 if chunk is None:
                     break
@@ -508,29 +518,20 @@ async def xhttp_downstream(uuid: str, request: Request, sid: str = ""):
     )
 
 
-@app.post("/xhttp/{uuid}")
-async def xhttp_upstream(uuid: str, request: Request, sid: str = ""):
+@app.post("/xhttp/{uuid}/{session_id}/{seq}")
+async def xhttp_upstream(uuid: str, session_id: str, seq: str, request: Request):
     """
-    Client sends POST with binary body (client → server data).
+    Xray POSTs /xhttp/{uuid}/{session_id}/{seq} with binary body for each chunk.
+    seq is a sequence number (0, 1, 2, …) – we accept and ignore it (order
+    is guaranteed by HTTP/1.1 and HTTP/2 stream ordering).
     """
     await ensure_default_link()
 
     if not await check_quota(uuid, 0):
         raise HTTPException(status_code=403, detail="quota exceeded or link disabled")
 
-    session_id = sid or request.headers.get("x-padding", "") or ""
-
-    if not session_id:
-        raise HTTPException(status_code=400, detail="missing session id")
-
-    async with XHTTP_SESSIONS_LOCK:
-        session = XHTTP_SESSIONS.get(session_id)
-        if session is None:
-            # GET hasn't arrived yet – create session and wait for relay
-            session = XHTTPSession(uuid)
-            session.conn_id = session_id
-            XHTTP_SESSIONS[session_id] = session
-            asyncio.create_task(xhttp_tcp_relay(session))
+    logger.info(f"[XHTTP] POST seq={seq} session={session_id} uuid={uuid}")
+    session = await _get_or_create_session(uuid, session_id)
 
     body = await request.body()
     if body:
